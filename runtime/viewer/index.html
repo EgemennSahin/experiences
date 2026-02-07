@@ -49,6 +49,8 @@
     }
   }
   </script>
+  <!-- Screenshot capture (html2canvas for DOM/SVG, canvas.toDataURL for <canvas>) -->
+  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
   <script type="module">
     import React from "react";
     import ReactDOM from "react-dom/client";
@@ -318,6 +320,58 @@
             } catch (err) {
               console.error("[viewer] Hot reload failed:", err);
             }
+          }
+
+          if (msg.type === "screenshot_request") {
+            const requestId = msg.id;
+            // Small delay to let any pending React renders settle
+            setTimeout(async () => {
+              try {
+                const root = document.getElementById("root");
+                if (!root) throw new Error("No #root element");
+
+                let dataUrl;
+
+                // Fast path: single <canvas> filling #root → native toDataURL
+                const canvases = root.querySelectorAll("canvas");
+                if (canvases.length === 1) {
+                  const cvs = canvases[0];
+                  const rootRect = root.getBoundingClientRect();
+                  const cvsRect = cvs.getBoundingClientRect();
+                  const fillsRoot =
+                    Math.abs(cvsRect.width - rootRect.width) < 20 &&
+                    Math.abs(cvsRect.height - rootRect.height) < 20;
+                  if (fillsRoot) {
+                    dataUrl = cvs.toDataURL("image/png");
+                  }
+                }
+
+                // Fallback: html2canvas for DOM/SVG/mixed content
+                if (!dataUrl && typeof html2canvas === "function") {
+                  const captured = await html2canvas(root, {
+                    backgroundColor: "#0a0a0a",
+                    useCORS: true,
+                    logging: false,
+                    scale: 1,
+                  });
+                  dataUrl = captured.toDataURL("image/png");
+                }
+
+                if (!dataUrl) throw new Error("No capture method available");
+
+                ws.send(JSON.stringify({
+                  type: "screenshot_response",
+                  id: requestId,
+                  dataUrl,
+                }));
+              } catch (err) {
+                ws.send(JSON.stringify({
+                  type: "screenshot_response",
+                  id: requestId,
+                  error: err.message,
+                }));
+              }
+            }, 100);
           }
         };
 

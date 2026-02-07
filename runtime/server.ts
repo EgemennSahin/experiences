@@ -348,6 +348,55 @@ app.post("/memory", (req, res) => {
   res.json({ saved: true });
 });
 
+// ── Screenshot capture ────────────────────────────────────
+
+const pendingScreenshots = new Map<string, {
+  resolve: (data: Buffer) => void;
+  reject: (err: Error) => void;
+  timer: NodeJS.Timeout;
+}>();
+
+app.get("/screenshot", (req, res) => {
+  // Find an open viewer WebSocket connection
+  let viewerWs: WebSocket | null = null;
+  for (const [ws] of wsConnections) {
+    if (ws.readyState === WebSocket.OPEN) {
+      viewerWs = ws;
+      break;
+    }
+  }
+
+  if (!viewerWs) {
+    res.status(503).json({ error: "No browser viewer connected. Open http://localhost:4321 first." });
+    return;
+  }
+
+  const requestId = `ss-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const timeoutMs = Math.min(parseInt(req.query.timeout as string) || 10000, 30000);
+
+  const promise = new Promise<Buffer>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingScreenshots.delete(requestId);
+      reject(new Error("Screenshot timeout"));
+    }, timeoutMs);
+
+    pendingScreenshots.set(requestId, { resolve, reject, timer });
+  });
+
+  // Ask the viewer to capture
+  viewerWs.send(JSON.stringify({ type: "screenshot_request", id: requestId }));
+
+  promise
+    .then((pngBuffer) => {
+      res.setHeader("Content-Type", "image/png");
+      res.setHeader("Content-Length", String(pngBuffer.length));
+      res.send(pngBuffer);
+    })
+    .catch((err) => {
+      res.status(500).json({ error: err.message });
+    });
+});
+
 // ── Sync (re-bundle) ──────────────────────────────────────
 
 app.post("/sync", async (_req, res) => {
@@ -460,6 +509,25 @@ export async function startServer() {
             type: "presence_update",
             participants: participantList(),
           });
+        }
+
+        if (msg.type === "screenshot_response") {
+          const pending = pendingScreenshots.get(msg.id);
+          if (pending) {
+            clearTimeout(pending.timer);
+            pendingScreenshots.delete(msg.id);
+
+            if (msg.error) {
+              pending.reject(new Error(msg.error));
+            } else if (msg.dataUrl) {
+              // Convert data URL to Buffer: "data:image/png;base64,iVBOR..."
+              const base64Data = msg.dataUrl.replace(/^data:image\/png;base64,/, "");
+              const buffer = Buffer.from(base64Data, "base64");
+              pending.resolve(buffer);
+            } else {
+              pending.reject(new Error("Empty screenshot response"));
+            }
+          }
         }
       } catch {
         // Ignore invalid messages

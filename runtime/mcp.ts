@@ -301,6 +301,55 @@ Actions:
   },
 );
 
+// ── Tool: screenshot ──────────────────────────────────────
+
+server.tool(
+  "screenshot",
+  `Capture a screenshot of the experience as seen in the browser.
+
+Returns the current visual state as a PNG image.
+Requires the browser viewer to be open at http://localhost:4321.
+
+Use this to see what the user sees — inspect paintings, check layouts, read rendered text, etc.`,
+  {
+    timeout: z.number().optional().describe("Max wait ms (default 10000)"),
+  },
+  async ({ timeout }) => {
+    try {
+      const t = Math.min(timeout || 10000, 30000);
+      const res = await fetch(`${SERVER_URL}/screenshot?timeout=${t}`);
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }));
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Screenshot failed: ${err.error || "Unknown error"}`,
+          }],
+        };
+      }
+
+      const arrayBuffer = await res.arrayBuffer();
+      const base64 = Buffer.from(arrayBuffer).toString("base64");
+
+      return {
+        content: [{
+          type: "image" as const,
+          data: base64,
+          mimeType: "image/png",
+        }],
+      };
+    } catch (err: any) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Screenshot failed: ${err.message}. Is the dev server running? Is the browser open at http://localhost:4321?`,
+        }],
+      };
+    }
+  },
+);
+
 // ── Start ──────────────────────────────────────────────────
 
 async function main() {

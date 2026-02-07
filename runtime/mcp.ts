@@ -2,7 +2,11 @@
  * Local MCP server for vibe-vibe experiences.
  * Stdio transport — talks to the local Express server at http://localhost:4321.
  *
- * 4 tools: room, watch, act, memory
+ * 4 tools: connect, watch, act, memory
+ *
+ * No room management — the agent auto-joins whatever room is active locally.
+ * If no room exists, one is created. If a room is already open in the browser,
+ * the agent joins that one. The room concept is invisible to the agent.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -16,6 +20,7 @@ const SERVER_URL = process.env.VIBEVIBES_SERVER_URL || "http://localhost:4321";
 let currentRoomId: string | null = null;
 let currentActorId: string | null = null;
 let lastEventTs = 0;
+let connected = false;
 
 // ── Helpers ────────────────────────────────────────────────
 
@@ -46,47 +51,75 @@ function formatToolList(tools: any[]): string {
     .join("\n");
 }
 
+/**
+ * Find or create a room, then join it.
+ *
+ * 1. GET /rooms — prefer a room with participants (browser is there).
+ * 2. Fallback to the first room that exists.
+ * 3. No rooms at all? Create one.
+ */
+async function autoJoin(): Promise<any> {
+  const roomList = await fetchJSON("/rooms");
+
+  let targetRoomId: string | null = null;
+
+  if (Array.isArray(roomList) && roomList.length > 0) {
+    const occupied = roomList.find((r: any) => r.participants?.length > 0);
+    targetRoomId = occupied?.roomId ?? roomList[0].roomId;
+  }
+
+  if (!targetRoomId) {
+    const created = await fetchJSON("/rooms", { method: "POST" });
+    if (created.error) throw new Error(created.error);
+    targetRoomId = created.roomId;
+  }
+
+  const join = await fetchJSON(`/rooms/${targetRoomId}/join`, {
+    method: "POST",
+    body: JSON.stringify({ username: "claude", actorType: "ai" }),
+  });
+
+  if (join.error) throw new Error(join.error);
+
+  currentRoomId = targetRoomId;
+  currentActorId = join.actorId;
+  lastEventTs = Date.now();
+  connected = true;
+
+  return join;
+}
+
+/** Ensure we're connected. If not, auto-join. */
+async function ensureConnected(): Promise<string> {
+  if (currentRoomId && connected) return currentRoomId;
+  await autoJoin();
+  return currentRoomId!;
+}
+
 // ── MCP Server ─────────────────────────────────────────────
 
 const server = new McpServer({
   name: "vibevibes-local",
-  version: "1.0.0",
+  version: "2.0.0",
 });
 
-// ── Tool: room ─────────────────────────────────────────────
+// ── Tool: connect ──────────────────────────────────────────
 
 server.tool(
-  "room",
-  `Enter a room, inspect its state, or re-sync the experience.
+  "connect",
+  `Connect to the running experience. Auto-joins whichever room is active locally.
+If a browser tab is open, you'll join that room. If no rooms exist, one is created.
 
-Actions:
-  open  — Create a room and join it. Returns tools, state, and browser URL.
-  state — Get current shared state + participants for a room.
-  sync  — Re-bundle src/index.tsx and hot-reload all rooms.`,
-  {
-    action: z.enum(["open", "state", "sync"]).describe("What to do"),
-    roomId: z.string().optional().describe("Room ID (for state action)"),
-  },
-  async ({ action, roomId }) => {
-    if (action === "open") {
-      // Create room
-      const room = await fetchJSON("/rooms", { method: "POST" });
-      if (room.error) {
-        return { content: [{ type: "text" as const, text: `Error: ${room.error}` }] };
-      }
+Returns: available tools, current state, participants, and the browser URL.
 
-      // Join room
-      const join = await fetchJSON(`/rooms/${room.roomId}/join`, {
-        method: "POST",
-        body: JSON.stringify({ username: "claude", actorType: "ai" }),
-      });
-
-      currentRoomId = room.roomId;
-      currentActorId = join.actorId;
-      lastEventTs = Date.now();
+Call this first before using watch or act.`,
+  {},
+  async () => {
+    try {
+      const join = await autoJoin();
 
       const output = [
-        `Joined room ${room.roomId} as ${join.actorId}`,
+        `Connected as ${currentActorId}`,
         `Experience: ${join.experienceId}`,
         `Browser: ${join.browserUrl}`,
         ``,
@@ -98,35 +131,14 @@ Actions:
       ].join("\n");
 
       return { content: [{ type: "text" as const, text: output }] };
+    } catch (err: any) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Failed to connect. Is the dev server running? (npm run dev)\n\nError: ${err.message}`,
+        }],
+      };
     }
-
-    if (action === "state") {
-      const rid = roomId || currentRoomId;
-      if (!rid) {
-        return { content: [{ type: "text" as const, text: "No room ID. Use `room open` first or provide roomId." }] };
-      }
-      const data = await fetchJSON(`/rooms/${rid}`);
-      if (data.error) {
-        return { content: [{ type: "text" as const, text: `Error: ${data.error}` }] };
-      }
-      const output = [
-        `Room: ${data.roomId}`,
-        `State: ${JSON.stringify(data.sharedState, null, 2)}`,
-        `Participants: ${data.participants?.join(", ")}`,
-        `Events: ${data.events?.length ?? 0}`,
-      ].join("\n");
-      return { content: [{ type: "text" as const, text: output }] };
-    }
-
-    if (action === "sync") {
-      const data = await fetchJSON("/sync", { method: "POST" });
-      if (data.error) {
-        return { content: [{ type: "text" as const, text: `Sync failed: ${data.error}` }] };
-      }
-      return { content: [{ type: "text" as const, text: `Synced: ${data.title}` }] };
-    }
-
-    return { content: [{ type: "text" as const, text: `Unknown action: ${action}` }] };
   },
 );
 
@@ -134,21 +146,25 @@ Actions:
 
 server.tool(
   "watch",
-  `Long-poll for activity in a joined room. Blocks until events arrive, predicate matches, or timeout.
+  `Wait for activity in the experience. Blocks until events arrive or timeout.
 
-Use predicate to wait for specific conditions, e.g. "state.count > 5".
-Use filterTools/filterActors to only wake for specific events.`,
+Use predicate to wait for a condition, e.g. "state.count > 5".
+Use filterTools to only wake for specific tools, e.g. ["pixel.place"].
+Use filterActors to only wake for specific actors.
+
+Auto-connects if not already connected.`,
   {
-    roomId: z.string().optional().describe("Room ID (defaults to current room)"),
     timeout: z.number().optional().describe("Max wait ms (default 30000, max 55000)"),
-    predicate: z.string().optional().describe("JS expression evaluated against { state, actorId }"),
-    filterTools: z.array(z.string()).optional().describe("Only wake for events from these tools"),
-    filterActors: z.array(z.string()).optional().describe("Only wake for events from these actors"),
+    predicate: z.string().optional().describe('JS expression, e.g. "state.count > 5"'),
+    filterTools: z.array(z.string()).optional().describe("Only wake for these tools"),
+    filterActors: z.array(z.string()).optional().describe("Only wake for these actors"),
   },
-  async ({ roomId, timeout, predicate, filterTools, filterActors }) => {
-    const rid = roomId || currentRoomId;
-    if (!rid) {
-      return { content: [{ type: "text" as const, text: "No room ID. Use `room open` first." }] };
+  async ({ timeout, predicate, filterTools, filterActors }) => {
+    let rid: string;
+    try {
+      rid = await ensureConnected();
+    } catch (err: any) {
+      return { content: [{ type: "text" as const, text: `Not connected: ${err.message}` }] };
     }
 
     const t = Math.min(timeout || 30000, 55000);
@@ -182,22 +198,17 @@ Use filterTools/filterActors to only wake for specific events.`,
 
     let events = data.events || [];
 
-    // Filter by tools
     if (filterTools?.length) {
       events = events.filter((e: any) => filterTools.includes(e.tool));
     }
-
-    // Filter by actors
     if (filterActors?.length) {
       events = events.filter((e: any) => filterActors.includes(e.actorId));
     }
 
-    // Update last event timestamp
     if (events.length > 0) {
       lastEventTs = Math.max(...events.map((e: any) => e.ts));
     }
 
-    // Evaluate predicate
     let predicateMatched = false;
     if (predicate) {
       try {
@@ -233,16 +244,21 @@ Use filterTools/filterActors to only wake for specific events.`,
 
 server.tool(
   "act",
-  `Execute a tool in a room to mutate shared state. All state changes go through the tool gate.`,
+  `Execute a tool to mutate shared state. All state changes go through tools.
+
+Example: act(toolName="counter.increment", input={amount: 2})
+
+Auto-connects if not already connected.`,
   {
-    roomId: z.string().optional().describe("Room ID (defaults to current room)"),
     toolName: z.string().describe("Tool to call, e.g. 'counter.increment'"),
     input: z.record(z.any()).optional().describe("Tool input parameters"),
   },
-  async ({ roomId, toolName, input }) => {
-    const rid = roomId || currentRoomId;
-    if (!rid) {
-      return { content: [{ type: "text" as const, text: "No room ID. Use `room open` first." }] };
+  async ({ toolName, input }) => {
+    let rid: string;
+    try {
+      rid = await ensureConnected();
+    } catch (err: any) {
+      return { content: [{ type: "text" as const, text: `Not connected: ${err.message}` }] };
     }
 
     const result = await fetchJSON(`/rooms/${rid}/tools/${toolName}`, {
@@ -257,7 +273,6 @@ server.tool(
       return { content: [{ type: "text" as const, text: `Tool error: ${result.error}` }] };
     }
 
-    // Get updated state
     const state = await fetchJSON(`/rooms/${rid}`);
 
     const output = [
@@ -273,14 +288,14 @@ server.tool(
 
 server.tool(
   "memory",
-  `Persistent agent memory (per-session). Survives across tool calls within a session.
+  `Persistent agent memory (per-session). Survives across tool calls.
 
 Actions:
   get — Retrieve current memory
   set — Merge updates into memory`,
   {
     action: z.enum(["get", "set"]).describe("What to do"),
-    updates: z.record(z.any()).optional().describe("Memory updates to merge (for set)"),
+    updates: z.record(z.any()).optional().describe("Key-value pairs to merge (for set)"),
   },
   async ({ action, updates }) => {
     const key = currentRoomId && currentActorId

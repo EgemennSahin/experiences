@@ -11,16 +11,22 @@ npm install
 npm run dev
 ```
 
-This starts a local server on `http://localhost:4321`. Open it in your browser — you're the human player.
+Open http://localhost:4321 in your browser — you're the human player. The dev server hot-reloads on save.
 
 ## Add an AI Agent
 
-This project includes a local MCP server (`.mcp.json`) that auto-registers with Claude Code. Just open the project in Claude Code and the agent can interact with your experience through 4 tools:
+This project includes a local MCP server (`.mcp.json`) that auto-registers with Claude Code. Open the project in Claude Code and the agent gets 4 tools:
 
-- **`room`** — Open a room, see available tools and current state
-- **`watch`** — Long-poll for activity from other participants
-- **`act`** — Execute a tool to change shared state
-- **`memory`** — Persist data across agent sessions
+| Tool | Purpose |
+|------|---------|
+| `connect` | Auto-join the active room (or create one). Returns tools, state, browser URL |
+| `watch` | Long-poll for activity from other participants |
+| `act` | Execute a tool to change shared state |
+| `memory` | Persist data across tool calls within a session |
+
+No room IDs to manage — the agent automatically joins whichever room the browser has open.
+
+**Typical agent loop:** `connect` -> `watch` -> `act` -> repeat.
 
 ## Build Your Experience
 
@@ -28,29 +34,100 @@ Edit `src/index.tsx`. That's the only file you need to touch. It exports three t
 
 ```tsx
 import { defineExperience, defineTool } from "@vibevibes/sdk";
+import { z } from "zod";
+import React from "react";
 
 export default defineExperience({
-  manifest: { id: "my-experience", version: "0.0.1", title: "My Experience" },
-  Canvas,  // React component — renders the UI
-  tools,   // Array of tools — mutate shared state
+  manifest: {
+    id: "my-experience",
+    version: "0.0.1",
+    title: "My Experience",
+    description: "What it does",
+    requested_capabilities: [],
+  },
+  Canvas,   // React component — renders the UI
+  tools,    // Array of tools — mutate shared state
 });
 ```
 
-**Canvas** receives `{ sharedState, callTool, participants, actorId }` as props. Render your UI based on `sharedState`, trigger changes with `callTool("toolName", input)`.
+### Canvas
 
-**Tools** are defined with `defineTool()`. Each has a name, Zod input schema, and a handler that receives `ctx` with `state`, `setState`, `actorId`, etc.
+A React component that receives:
 
-The dev server hot-reloads on save — changes appear instantly in the browser.
+| Prop | Type | Description |
+|------|------|-------------|
+| `roomId` | `string` | Current room ID |
+| `actorId` | `string` | Your actor ID (e.g. `"alice-human-1"`) |
+| `sharedState` | `Record<string, any>` | Current shared state (read-only from here) |
+| `callTool` | `(name, input) => Promise<any>` | Call a tool to mutate state |
+| `participants` | `string[]` | Actor IDs of everyone in the room |
+| `ephemeralState` | `Record<string, Record<string, any>>` | Per-actor ephemeral data |
+| `setEphemeral` | `(data) => void` | Set your ephemeral data |
 
-## Publish to vibevibes.app
+Render your UI based on `sharedState`. Trigger changes with `callTool("toolName", input)`.
 
-When your experience is ready for multiplayer:
+### Tools
+
+Tools are the **only** way to mutate shared state. Each tool has a name, Zod input schema, and a handler:
+
+```tsx
+defineTool({
+  name: "counter.increment",
+  description: "Add to the counter",
+  input_schema: z.object({
+    amount: z.number().default(1).describe("Amount to add"),
+  }),
+  handler: async (ctx, input) => {
+    const newCount = (ctx.state.count || 0) + input.amount;
+    ctx.setState({ ...ctx.state, count: newCount });
+    return { count: newCount };
+  },
+})
+```
+
+The handler receives `ctx` with:
+- `ctx.state` — current shared state
+- `ctx.setState(newState)` — set new state (shallow merge, always spread existing)
+- `ctx.actorId` — who called the tool
+- `ctx.roomId`, `ctx.timestamp`, `ctx.memory`, `ctx.setMemory()`
+
+Shorthand: `quickTool(name, description, zodSchema, handler)`.
+
+### Hooks
+
+| Hook | Usage | Purpose |
+|------|-------|---------|
+| `useToolCall(callTool)` | `{ call, loading, error }` | Loading/error tracking |
+| `useSharedState(sharedState, key, default?)` | `value` | Typed state accessor |
+| `useOptimisticTool(callTool, sharedState)` | `{ call, state, pending }` | Optimistic updates |
+| `useParticipants(participants)` | `ParsedParticipant[]` | Parse actor IDs |
+| `useAnimationFrame(sharedState, interpolate?)` | `displayState` | Frame-rate buffering |
+
+### Components
+
+Inline-styled components (no Tailwind dependency):
+
+`Button`, `Card`, `Input`, `Badge`, `Stack`, `Grid`
+
+Import from `@vibevibes/sdk`.
+
+## Publish
 
 ```bash
 npm run publish:experience
 ```
 
-This uploads your `src/index.tsx` to the hosted platform. The same file runs identically in both environments.
+Uploads `src/index.tsx` to the hosted platform. Same file runs identically in both environments.
+
+## How It Works
+
+All state lives on the server. All mutations go through tools — no direct state setting. When a tool is called (by a human clicking a button or an agent calling `act`), the server validates input against the Zod schema, runs the handler, updates state, and broadcasts to all connected clients via WebSocket.
+
+```
+Browser (Canvas)  <--WebSocket-->  Server  <--HTTP-->  MCP (Agent)
+```
+
+This is the same architecture as the hosted platform, just single-room and local.
 
 ## Project Structure
 
@@ -64,11 +141,5 @@ scripts/dev.ts         — Dev server entry
 scripts/publish.ts     — Publish to hosted platform
 vibevibes.json         — Experience ID + platform URL
 .mcp.json              — Auto-registers MCP server with Claude Code
-CLAUDE.md              — Agent instructions
+CLAUDE.md              — Full SDK reference for LLMs
 ```
-
-## How It Works
-
-All state lives on the server. All mutations go through tools — no direct state setting. When a tool is called (by a human clicking a button or an agent calling `act`), the server validates the input against the Zod schema, runs the handler, updates state, and broadcasts the change to all connected clients via WebSocket.
-
-This is the same architecture as the hosted platform, just single-room and local.

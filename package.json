@@ -1,0 +1,30 @@
+{
+  "name": "my-vibevibes-experience",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx scripts/dev.ts",
+    "build": "tsx runtime/bundler.ts",
+    "publish:experience": "tsx scripts/publish.ts"
+  },
+  "dependencies": {
+    "@vibevibes/sdk": "^0.1.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "zod": "^3.22.4",
+    "esbuild": "^0.27.2",
+    "express": "^4.18.2",
+    "ws": "^8.19.0",
+    "@modelcontextprotocol/sdk": "^1.9.0",
+    "zod-to-json-schema": "^3.22.4"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3",
+    "@types/express": "^4.17.21",
+    "@types/ws": "^8.18.1",
+    "@types/react": "^18.2.48",
+    "@types/node": "^20.11.5"
+  }
+}

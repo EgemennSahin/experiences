@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>vibe-vibe</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { width: 100%; height: 100%; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #0a0a0a; color: #fff; }
+    #loading {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      height: 100vh; gap: 16px; color: #94a3b8;
+    }
+    #loading .spinner {
+      width: 32px; height: 32px; border: 2px solid #334155;
+      border-top-color: #6366f1; border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #error-display {
+      display: none; padding: 32px; max-width: 600px; margin: 80px auto;
+      background: #1e1e2e; border: 1px solid #ef4444; border-radius: 12px;
+    }
+    #error-display h2 { color: #ef4444; margin-bottom: 12px; }
+    #error-display pre { font-size: 13px; color: #94a3b8; white-space: pre-wrap; word-break: break-word; }
+  </style>
+</head>
+<body>
+  <div id="loading">
+    <div class="spinner"></div>
+    <div>Loading experience...</div>
+  </div>
+  <div id="error-display">
+    <h2>Experience Error</h2>
+    <pre id="error-message"></pre>
+  </div>
+  <div id="root"></div>
+
+  <!-- External deps from CDN -->
+  <script type="importmap">
+  {
+    "imports": {
+      "react": "https://esm.sh/react@18.2.0",
+      "react-dom": "https://esm.sh/react-dom@18.2.0",
+      "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+      "zod": "https://esm.sh/zod@3.22.4",
+      "yjs": "https://esm.sh/yjs@13.6.10"
+    }
+  }
+  </script>
+  <script type="module">
+    import React from "react";
+    import ReactDOM from "react-dom/client";
+    import { z } from "zod";
+    import * as Y from "yjs";
+
+    // ── Set up globalThis ────────────────────────────────────
+
+    globalThis.React = React;
+    globalThis.Y = Y;
+    globalThis.z = z;
+
+    // SDK define helpers (same contract as @vibevibes/sdk)
+    globalThis.defineExperience = (config) => config;
+    globalThis.defineTool = (config) => ({ risk: "low", capabilities_required: [], ...config });
+    globalThis.defineTest = (config) => config;
+    globalThis.quickTool = (name, desc, schema, handler) =>
+      globalThis.defineTool({ name, description: desc, input_schema: schema, handler });
+
+    // Hooks — implemented inline for the local viewer
+    const { useState, useEffect, useCallback, useRef } = React;
+
+    function useSharedState(key, defaultValue) {
+      const ctx = globalThis.__vibevibes_ctx__;
+      if (!ctx) return [defaultValue, () => {}];
+      const value = ctx.sharedState?.[key] ?? defaultValue;
+      return [value, () => {}]; // read-only from hooks; mutations go through callTool
+    }
+
+    function useToolCall() {
+      const ctx = globalThis.__vibevibes_ctx__;
+      return ctx?.callTool || (async () => {});
+    }
+
+    function useOptimisticTool(toolName) {
+      const ctx = globalThis.__vibevibes_ctx__;
+      const callTool = ctx?.callTool || (async () => {});
+      return useCallback(
+        (input, predictFn) => callTool(toolName, input),
+        [toolName, callTool]
+      );
+    }
+
+    function useParticipants() {
+      const ctx = globalThis.__vibevibes_ctx__;
+      return ctx?.participants || [];
+    }
+
+    function useAnimationFrame(callback) {
+      const callbackRef = useRef(callback);
+      callbackRef.current = callback;
+      useEffect(() => {
+        let running = true;
+        function loop(time) {
+          if (!running) return;
+          callbackRef.current(time);
+          requestAnimationFrame(loop);
+        }
+        requestAnimationFrame(loop);
+        return () => { running = false; };
+      }, []);
+    }
+
+    function useFollow() { return [null, () => {}]; }
+    function useTypingIndicator() { return [[], () => {}]; }
+
+    globalThis.vibevibesHooks = {
+      useToolCall, useSharedState, useOptimisticTool, useParticipants,
+      useAnimationFrame, useFollow, useTypingIndicator,
+    };
+
+    // UI Components (minimal inline versions)
+    const ce = React.createElement;
+    globalThis.vibevibesComponents = {
+      Button: ({ onClick, children, variant, ...props }) =>
+        ce("button", {
+          onClick,
+          style: {
+            padding: "8px 16px", borderRadius: "6px", cursor: "pointer",
+            background: variant === "ghost" ? "transparent" : "#6366f1",
+            color: "#fff", border: variant === "ghost" ? "1px solid #334155" : "none",
+            fontSize: "14px", ...props.style,
+          },
+          ...props,
+        }, children),
+      Card: ({ children, ...props }) =>
+        ce("div", {
+          style: { background: "#1e1e2e", borderRadius: "12px", padding: "16px", border: "1px solid #334155", ...props.style },
+          ...props,
+        }, children),
+      Input: (props) =>
+        ce("input", {
+          style: {
+            padding: "8px 12px", borderRadius: "6px", background: "#1e293b",
+            color: "#fff", border: "1px solid #334155", outline: "none", width: "100%",
+            ...props.style,
+          },
+          ...props,
+        }),
+      Badge: ({ children, ...props }) =>
+        ce("span", {
+          style: { padding: "2px 8px", borderRadius: "9999px", background: "#334155", color: "#94a3b8", fontSize: "12px", ...props.style },
+          ...props,
+        }, children),
+      Stack: ({ children, gap, direction, ...props }) =>
+        ce("div", {
+          style: { display: "flex", flexDirection: direction || "column", gap: gap || "8px", ...props.style },
+          ...props,
+        }, children),
+      Grid: ({ children, columns, gap, ...props }) =>
+        ce("div", {
+          style: { display: "grid", gridTemplateColumns: `repeat(${columns || 2}, 1fr)`, gap: gap || "8px", ...props.style },
+          ...props,
+        }, children),
+    };
+
+    // ── Connect to room ──────────────────────────────────────
+
+    const SERVER = location.origin;
+    const WS_URL = `ws://${location.host}`;
+
+    function showError(msg) {
+      document.getElementById("loading").style.display = "none";
+      document.getElementById("error-display").style.display = "block";
+      document.getElementById("error-message").textContent = msg;
+    }
+
+    async function start() {
+      try {
+        // Get room ID from hash or create new room
+        let roomId = location.hash.slice(1);
+        if (!roomId) {
+          const room = await fetch(`${SERVER}/rooms`, { method: "POST" }).then(r => r.json());
+          if (room.error) throw new Error(room.error);
+          roomId = room.roomId;
+          location.hash = roomId;
+        }
+
+        // Connect WebSocket
+        const ws = new WebSocket(WS_URL);
+
+        let actorId = "viewer";
+        let sharedState = {};
+        let participants = [];
+        let reactRoot = null;
+        let Canvas = null;
+
+        function render() {
+          if (!Canvas || !reactRoot) return;
+
+          // Expose context for hooks
+          globalThis.__vibevibes_ctx__ = {
+            sharedState,
+            callTool,
+            participants,
+            actorId,
+          };
+
+          reactRoot.render(
+            ce(CanvasErrorBoundary, null,
+              ce(Canvas, {
+                roomId,
+                actorId,
+                sharedState,
+                callTool,
+                participants,
+                ephemeralState: {},
+                setEphemeral: () => {},
+              })
+            )
+          );
+        }
+
+        async function callTool(name, input) {
+          const res = await fetch(`${SERVER}/rooms/${roomId}/tools/${name}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ actorId, input: input || {} }),
+          });
+          const data = await res.json();
+          if (data.error) throw new Error(data.error);
+          return data.output;
+        }
+
+        // Error boundary component
+        class CanvasErrorBoundary extends React.Component {
+          constructor(props) {
+            super(props);
+            this.state = { error: null };
+          }
+          static getDerivedStateFromError(error) { return { error }; }
+          componentDidCatch(error, info) {
+            console.error("[viewer] Experience crashed:", error, info?.componentStack);
+          }
+          render() {
+            if (this.state.error) {
+              return ce("div", {
+                style: { padding: "32px", textAlign: "center", color: "#ef4444" },
+              },
+                ce("h2", null, "Experience Crashed"),
+                ce("pre", { style: { fontSize: "13px", color: "#94a3b8", marginTop: "12px", whiteSpace: "pre-wrap" } },
+                  this.state.error.message),
+                ce("button", {
+                  onClick: () => this.setState({ error: null }),
+                  style: { marginTop: "16px", padding: "8px 16px", background: "#6366f1", color: "#fff", border: "none", borderRadius: "6px", cursor: "pointer" },
+                }, "Try Again"),
+              );
+            }
+            return this.props.children;
+          }
+        }
+
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: "join", roomId, username: "viewer" }));
+        };
+
+        ws.onmessage = async (event) => {
+          const msg = JSON.parse(event.data);
+
+          if (msg.type === "joined") {
+            actorId = msg.actorId;
+            sharedState = msg.sharedState || {};
+            participants = msg.participants || [];
+
+            // Load client bundle
+            try {
+              const bundleRes = await fetch(`${SERVER}/rooms/${roomId}/bundle`);
+              const bundleCode = await bundleRes.text();
+
+              const blob = new Blob([bundleCode], { type: "text/javascript" });
+              const url = URL.createObjectURL(blob);
+              const mod = await import(url);
+              URL.revokeObjectURL(url);
+
+              const experience = mod.default ?? mod;
+              if (!experience?.Canvas) throw new Error("Experience has no Canvas component");
+
+              Canvas = experience.Canvas;
+              reactRoot = ReactDOM.createRoot(document.getElementById("root"));
+
+              document.getElementById("loading").style.display = "none";
+              render();
+            } catch (err) {
+              showError(`Failed to load experience: ${err.message}`);
+            }
+          }
+
+          if (msg.type === "shared_state_update") {
+            sharedState = msg.state;
+            participants = msg.participants || participants;
+            render();
+          }
+
+          if (msg.type === "presence_update") {
+            participants = msg.participants || participants;
+            render();
+          }
+
+          if (msg.type === "experience_updated") {
+            // Hot reload: re-fetch bundle and re-render
+            try {
+              const bundleRes = await fetch(`${SERVER}/rooms/${roomId}/bundle`);
+              const bundleCode = await bundleRes.text();
+
+              const blob = new Blob([bundleCode], { type: "text/javascript" });
+              const url = URL.createObjectURL(blob);
+              const mod = await import(url);
+              URL.revokeObjectURL(url);
+
+              const experience = mod.default ?? mod;
+              if (experience?.Canvas) {
+                Canvas = experience.Canvas;
+                render();
+                console.log("[viewer] Hot reloaded");
+              }
+            } catch (err) {
+              console.error("[viewer] Hot reload failed:", err);
+            }
+          }
+        };
+
+        ws.onerror = (err) => {
+          console.error("[viewer] WebSocket error:", err);
+        };
+
+        ws.onclose = () => {
+          console.log("[viewer] WebSocket closed, reconnecting in 2s...");
+          setTimeout(() => location.reload(), 2000);
+        };
+
+      } catch (err) {
+        showError(err.message);
+      }
+    }
+
+    start();
+  </script>
+</body>
+</html>

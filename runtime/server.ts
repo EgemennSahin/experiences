@@ -1,6 +1,10 @@
 /**
  * Local vibe-vibe runtime server.
- * In-memory rooms, tool gate, WebSocket broadcasts — no Supabase needed.
+ * Single shared room, tool gate, WebSocket broadcasts — no Supabase needed.
+ *
+ * There is exactly one room. Opening localhost:4321 puts you in it.
+ * Refreshing the page cleans up the old participant and creates a new one.
+ * AI agents join the same room via MCP or HTTP.
  */
 
 import express from "express";
@@ -28,19 +32,16 @@ interface ToolEvent {
   error?: string;
 }
 
-interface Room {
-  roomId: string;
-  experienceId: string;
-  sharedState: Record<string, any>;
-  participants: Map<string, { type: "human" | "ai"; joinedAt: number }>;
-  events: ToolEvent[];
-  actorCounters: Map<string, number>;
-  wsConnections: Set<WebSocket>;
-}
+// ── State (single room) ────────────────────────────────────
 
-// ── State ──────────────────────────────────────────────────
+const ROOM_ID = "local";
 
-const rooms = new Map<string, Room>();
+let sharedState: Record<string, any> = {};
+const participants = new Map<string, { type: "human" | "ai"; joinedAt: number }>();
+let events: ToolEvent[] = [];
+const actorCounters = new Map<string, number>();
+const wsConnections = new Map<WebSocket, string>(); // ws → actorId
+
 const agentMemory = new Map<string, Record<string, any>>();
 
 let experience: any = null;
@@ -49,15 +50,11 @@ let serverCode: string = "";
 
 // ── Helpers ────────────────────────────────────────────────
 
-function generateId(): string {
-  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-}
-
-function assignActorId(room: Room, username: string, type: "human" | "ai"): string {
+function assignActorId(username: string, type: "human" | "ai"): string {
   const prefix = `${username}-${type}`;
-  const current = room.actorCounters.get(prefix) || 0;
+  const current = actorCounters.get(prefix) || 0;
   const next = current + 1;
-  room.actorCounters.set(prefix, next);
+  actorCounters.set(prefix, next);
   return `${prefix}-${next}`;
 }
 
@@ -71,13 +68,17 @@ function getToolList(exp: any): any[] {
   }));
 }
 
-function broadcastToRoom(room: Room, message: any) {
+function broadcastToAll(message: any) {
   const data = JSON.stringify(message);
-  for (const ws of room.wsConnections) {
+  for (const ws of wsConnections.keys()) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(data);
     }
   }
+}
+
+function participantList(): string[] {
+  return Array.from(participants.keys());
 }
 
 // ── Load experience ────────────────────────────────────────
@@ -142,85 +143,67 @@ app.get("/", (_req, res) => {
 });
 app.use("/viewer", express.static(path.join(__dirname, "viewer")));
 
-// ── Room endpoints ─────────────────────────────────────────
+// ── Room state endpoint ────────────────────────────────────
 
-// Create room
-app.post("/rooms", (_req, res) => {
+app.get("/state", (_req, res) => {
+  res.json({
+    roomId: ROOM_ID,
+    experienceId: experience?.manifest?.id ?? "unknown",
+    sharedState,
+    participants: participantList(),
+    events: events.slice(-50),
+  });
+});
+
+// ── Join ────────────────────────────────────────────────────
+
+function handleJoin(req: express.Request, res: express.Response) {
   if (!experience) {
     res.status(500).json({ error: "Experience not loaded" });
     return;
   }
-  const roomId = generateId();
-  const room: Room = {
-    roomId,
-    experienceId: experience.manifest.id,
-    sharedState: {},
-    participants: new Map(),
-    events: [],
-    actorCounters: new Map(),
-    wsConnections: new Set(),
-  };
-  rooms.set(roomId, room);
-  res.json({ roomId, experienceId: experience.manifest.id });
-});
-
-// Get room state
-app.get("/rooms/:roomId", (req, res) => {
-  const room = rooms.get(req.params.roomId);
-  if (!room) { res.status(404).json({ error: "Room not found" }); return; }
-  res.json({
-    roomId: room.roomId,
-    experienceId: room.experienceId,
-    sharedState: room.sharedState,
-    participants: Array.from(room.participants.keys()),
-    events: room.events.slice(-50),
-  });
-});
-
-// Join room
-app.post("/rooms/:roomId/join", (req, res) => {
-  const room = rooms.get(req.params.roomId);
-  if (!room) { res.status(404).json({ error: "Room not found" }); return; }
 
   const { username = "user", actorType = "human" } = req.body;
-  const actorId = assignActorId(room, username, actorType as "human" | "ai");
-  room.participants.set(actorId, { type: actorType, joinedAt: Date.now() });
+  const actorId = assignActorId(username, actorType as "human" | "ai");
+  participants.set(actorId, { type: actorType, joinedAt: Date.now() });
 
   // Broadcast presence update
-  broadcastToRoom(room, {
+  broadcastToAll({
     type: "presence_update",
-    participants: Array.from(room.participants.keys()),
+    participants: participantList(),
   });
 
   res.json({
-    roomId: room.roomId,
+    roomId: ROOM_ID,
     actorId,
-    experienceId: room.experienceId,
-    sharedState: room.sharedState,
-    participants: Array.from(room.participants.keys()),
-    events: room.events.slice(-20),
+    experienceId: experience.manifest.id,
+    sharedState,
+    participants: participantList(),
+    events: events.slice(-20),
     tools: getToolList(experience),
-    browserUrl: `http://localhost:${PORT}/#${room.roomId}`,
+    browserUrl: `http://localhost:${PORT}`,
   });
-});
+}
 
-// Leave room
-app.post("/rooms/:roomId/leave", (req, res) => {
-  const room = rooms.get(req.params.roomId);
-  if (!room) { res.status(404).json({ error: "Room not found" }); return; }
+app.post("/join", handleJoin);
+
+// ── Leave ───────────────────────────────────────────────────
+
+function handleLeave(req: express.Request, res: express.Response) {
   const { actorId } = req.body;
-  room.participants.delete(actorId);
-  broadcastToRoom(room, {
+  participants.delete(actorId);
+  broadcastToAll({
     type: "presence_update",
-    participants: Array.from(room.participants.keys()),
+    participants: participantList(),
   });
   res.json({ left: true, actorId });
-});
+}
 
-// Execute tool
-app.post("/rooms/:roomId/tools/:toolName", async (req, res) => {
-  const room = rooms.get(req.params.roomId);
-  if (!room) { res.status(404).json({ error: "Room not found" }); return; }
+app.post("/leave", handleLeave);
+
+// ── Execute tool ────────────────────────────────────────────
+
+async function handleTool(req: express.Request, res: express.Response) {
   if (!experience) { res.status(500).json({ error: "Experience not loaded" }); return; }
 
   const toolName = req.params.toolName;
@@ -241,14 +224,14 @@ app.post("/rooms/:roomId/tools/:toolName", async (req, res) => {
     }
 
     // Build ToolCtx
-    const memoryKey = `${room.experienceId}:${actorId}`;
+    const memoryKey = `${experience.manifest.id}:${actorId}`;
     const ctx = {
-      roomId: room.roomId,
+      roomId: ROOM_ID,
       actorId,
       owner: owner || actorId.split("-")[0],
-      state: room.sharedState,
+      state: sharedState,
       setState: (newState: Record<string, any>) => {
-        room.sharedState = newState;
+        sharedState = newState;
       },
       timestamp: Date.now(),
       memory: agentMemory.get(memoryKey) || {},
@@ -273,16 +256,16 @@ app.post("/rooms/:roomId/tools/:toolName", async (req, res) => {
     };
 
     // Append event (cap at 200)
-    room.events.push(event);
-    if (room.events.length > 200) {
-      room.events = room.events.slice(-200);
+    events.push(event);
+    if (events.length > 200) {
+      events = events.slice(-200);
     }
 
     // Broadcast state update
-    broadcastToRoom(room, {
+    broadcastToAll({
       type: "shared_state_update",
-      roomId: room.roomId,
-      state: room.sharedState,
+      roomId: ROOM_ID,
+      state: sharedState,
       event,
       changedBy: actorId,
       tool: toolName,
@@ -299,27 +282,27 @@ app.post("/rooms/:roomId/tools/:toolName", async (req, res) => {
       input,
       error: errorMsg,
     };
-    room.events.push(event);
+    events.push(event);
     res.status(400).json({ error: errorMsg });
   }
-});
+}
 
-// Get events (supports long-poll via ?timeout=N)
-app.get("/rooms/:roomId/events", async (req, res) => {
-  const room = rooms.get(req.params.roomId);
-  if (!room) { res.status(404).json({ error: "Room not found" }); return; }
+app.post("/tools/:toolName", handleTool);
 
+// ── Get events (supports long-poll via ?timeout=N) ─────────
+
+app.get("/events", async (req, res) => {
   const since = parseInt(req.query.since as string) || 0;
   const timeout = Math.min(parseInt(req.query.timeout as string) || 0, 55000);
 
-  const getNewEvents = () => room.events.filter((e) => e.ts > since);
+  const getNewEvents = () => events.filter((e) => e.ts > since);
 
-  let events = getNewEvents();
-  if (events.length > 0 || timeout === 0) {
+  let newEvents = getNewEvents();
+  if (newEvents.length > 0 || timeout === 0) {
     res.json({
-      events,
-      sharedState: room.sharedState,
-      participants: Array.from(room.participants.keys()),
+      events: newEvents,
+      sharedState,
+      participants: participantList(),
     });
     return;
   }
@@ -327,13 +310,13 @@ app.get("/rooms/:roomId/events", async (req, res) => {
   // Long-poll: wait for events or timeout
   const start = Date.now();
   const interval = setInterval(() => {
-    events = getNewEvents();
-    if (events.length > 0 || Date.now() - start >= timeout) {
+    newEvents = getNewEvents();
+    if (newEvents.length > 0 || Date.now() - start >= timeout) {
       clearInterval(interval);
       res.json({
-        events,
-        sharedState: room.sharedState,
-        participants: Array.from(room.participants.keys()),
+        events: newEvents,
+        sharedState,
+        participants: participantList(),
       });
     }
   }, 200);
@@ -342,8 +325,9 @@ app.get("/rooms/:roomId/events", async (req, res) => {
   req.on("close", () => clearInterval(interval));
 });
 
-// Serve client bundle
-app.get("/rooms/:roomId/bundle", (_req, res) => {
+// ── Serve client bundle ────────────────────────────────────
+
+app.get("/bundle", (_req, res) => {
   res.setHeader("Content-Type", "text/javascript");
   res.send(clientBundle);
 });
@@ -369,26 +353,73 @@ app.post("/memory", (req, res) => {
 app.post("/sync", async (_req, res) => {
   try {
     await loadExperience();
-    // Notify all rooms
-    for (const room of rooms.values()) {
-      broadcastToRoom(room, { type: "experience_updated" });
-    }
+    broadcastToAll({ type: "experience_updated" });
     res.json({ synced: true, title: experience?.manifest?.title });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── List rooms ─────────────────────────────────────────────
+// ── Backwards-compat: room-based routes redirect to single room ──
 
 app.get("/rooms", (_req, res) => {
-  const list = Array.from(rooms.values()).map((r) => ({
-    roomId: r.roomId,
-    experienceId: r.experienceId,
-    participants: Array.from(r.participants.keys()),
-    eventCount: r.events.length,
-  }));
-  res.json(list);
+  // Return the single room so MCP/agents that still call GET /rooms work
+  res.json([{
+    roomId: ROOM_ID,
+    experienceId: experience?.manifest?.id ?? "unknown",
+    participants: participantList(),
+    eventCount: events.length,
+  }]);
+});
+
+app.post("/rooms", (_req, res) => {
+  // No-op: return the single room
+  res.json({ roomId: ROOM_ID, experienceId: experience?.manifest?.id ?? "unknown" });
+});
+
+app.get("/rooms/:roomId", (_req, res) => {
+  res.json({
+    roomId: ROOM_ID,
+    experienceId: experience?.manifest?.id ?? "unknown",
+    sharedState,
+    participants: participantList(),
+    events: events.slice(-50),
+  });
+});
+
+app.post("/rooms/:roomId/join", handleJoin);
+
+app.post("/rooms/:roomId/leave", handleLeave);
+
+app.post("/rooms/:roomId/tools/:toolName", handleTool);
+
+app.get("/rooms/:roomId/events", (req, res) => {
+  // Rewrite to use the same handler inline
+  const since = parseInt(req.query.since as string) || 0;
+  const timeout = Math.min(parseInt(req.query.timeout as string) || 0, 55000);
+
+  const getNewEvents = () => events.filter((e) => e.ts > since);
+
+  let newEvents = getNewEvents();
+  if (newEvents.length > 0 || timeout === 0) {
+    res.json({ events: newEvents, sharedState, participants: participantList() });
+    return;
+  }
+
+  const start = Date.now();
+  const interval = setInterval(() => {
+    newEvents = getNewEvents();
+    if (newEvents.length > 0 || Date.now() - start >= timeout) {
+      clearInterval(interval);
+      res.json({ events: newEvents, sharedState, participants: participantList() });
+    }
+  }, 200);
+  req.on("close", () => clearInterval(interval));
+});
+
+app.get("/rooms/:roomId/bundle", (_req, res) => {
+  res.setHeader("Content-Type", "text/javascript");
+  res.send(clientBundle);
 });
 
 // ── Start server ───────────────────────────────────────────
@@ -402,39 +433,33 @@ export async function startServer() {
   const wss = new WebSocketServer({ server });
 
   wss.on("connection", (ws) => {
-    let joinedRoom: Room | null = null;
-
     ws.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString());
 
-        if (msg.type === "join" && msg.roomId) {
-          const room = rooms.get(msg.roomId);
-          if (room) {
-            joinedRoom = room;
-            room.wsConnections.add(ws);
+        if (msg.type === "join") {
+          const username = msg.username || "viewer";
+          const actorId = assignActorId(username, "human");
+          participants.set(actorId, { type: "human", joinedAt: Date.now() });
 
-            // If this is a human viewer, assign actor ID and add to participants
-            const username = msg.username || "viewer";
-            const actorId = assignActorId(room, username, "human");
-            room.participants.set(actorId, { type: "human", joinedAt: Date.now() });
+          // Track this WS → actorId so we clean up on disconnect
+          wsConnections.set(ws, actorId);
 
-            // Send initial state
-            ws.send(JSON.stringify({
-              type: "joined",
-              roomId: room.roomId,
-              actorId,
-              sharedState: room.sharedState,
-              participants: Array.from(room.participants.keys()),
-              events: room.events.slice(-20),
-            }));
+          // Send initial state
+          ws.send(JSON.stringify({
+            type: "joined",
+            roomId: ROOM_ID,
+            actorId,
+            sharedState,
+            participants: participantList(),
+            events: events.slice(-20),
+          }));
 
-            // Broadcast presence update to others
-            broadcastToRoom(room, {
-              type: "presence_update",
-              participants: Array.from(room.participants.keys()),
-            });
-          }
+          // Broadcast presence update to others
+          broadcastToAll({
+            type: "presence_update",
+            participants: participantList(),
+          });
         }
       } catch {
         // Ignore invalid messages
@@ -442,8 +467,17 @@ export async function startServer() {
     });
 
     ws.on("close", () => {
-      if (joinedRoom) {
-        joinedRoom.wsConnections.delete(ws);
+      // Clean up participant when browser tab closes / refreshes
+      const actorId = wsConnections.get(ws);
+      if (actorId) {
+        participants.delete(actorId);
+        wsConnections.delete(ws);
+
+        // Broadcast updated presence
+        broadcastToAll({
+          type: "presence_update",
+          participants: participantList(),
+        });
       }
     });
   });
@@ -457,9 +491,7 @@ export async function startServer() {
       console.log("\nFile changed, rebuilding...");
       try {
         await loadExperience();
-        for (const room of rooms.values()) {
-          broadcastToRoom(room, { type: "experience_updated" });
-        }
+        broadcastToAll({ type: "experience_updated" });
         console.log("Hot reload complete.");
       } catch (err: any) {
         console.error("Hot reload failed:", err.message);
@@ -471,7 +503,6 @@ export async function startServer() {
     console.log(`\n  vibe-vibe local runtime`);
     console.log(`  ───────────────────────`);
     console.log(`  Viewer:  http://localhost:${PORT}`);
-    console.log(`  API:     http://localhost:${PORT}/rooms`);
     console.log(`  Watching src/index.tsx for changes\n`);
   });
 

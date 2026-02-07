@@ -4,9 +4,8 @@
  *
  * 4 tools: connect, watch, act, memory
  *
- * No room management — the agent auto-joins whatever room is active locally.
- * If no room exists, one is created. If a room is already open in the browser,
- * the agent joins that one. The room concept is invisible to the agent.
+ * Single room — the agent auto-joins the one shared room.
+ * No room management needed.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -17,7 +16,6 @@ const SERVER_URL = process.env.VIBEVIBES_SERVER_URL || "http://localhost:4321";
 
 // ── State ──────────────────────────────────────────────────
 
-let currentRoomId: string | null = null;
 let currentActorId: string | null = null;
 let lastEventTs = 0;
 let connected = false;
@@ -52,36 +50,16 @@ function formatToolList(tools: any[]): string {
 }
 
 /**
- * Find or create a room, then join it.
- *
- * 1. GET /rooms — prefer a room with participants (browser is there).
- * 2. Fallback to the first room that exists.
- * 3. No rooms at all? Create one.
+ * Join the single shared room.
  */
-async function autoJoin(): Promise<any> {
-  const roomList = await fetchJSON("/rooms");
-
-  let targetRoomId: string | null = null;
-
-  if (Array.isArray(roomList) && roomList.length > 0) {
-    const occupied = roomList.find((r: any) => r.participants?.length > 0);
-    targetRoomId = occupied?.roomId ?? roomList[0].roomId;
-  }
-
-  if (!targetRoomId) {
-    const created = await fetchJSON("/rooms", { method: "POST" });
-    if (created.error) throw new Error(created.error);
-    targetRoomId = created.roomId;
-  }
-
-  const join = await fetchJSON(`/rooms/${targetRoomId}/join`, {
+async function joinRoom(): Promise<any> {
+  const join = await fetchJSON("/join", {
     method: "POST",
     body: JSON.stringify({ username: "claude", actorType: "ai" }),
   });
 
   if (join.error) throw new Error(join.error);
 
-  currentRoomId = targetRoomId;
   currentActorId = join.actorId;
   lastEventTs = Date.now();
   connected = true;
@@ -89,11 +67,10 @@ async function autoJoin(): Promise<any> {
   return join;
 }
 
-/** Ensure we're connected. If not, auto-join. */
-async function ensureConnected(): Promise<string> {
-  if (currentRoomId && connected) return currentRoomId;
-  await autoJoin();
-  return currentRoomId!;
+/** Ensure we're connected. If not, join. */
+async function ensureConnected(): Promise<void> {
+  if (connected) return;
+  await joinRoom();
 }
 
 // ── MCP Server ─────────────────────────────────────────────
@@ -107,8 +84,7 @@ const server = new McpServer({
 
 server.tool(
   "connect",
-  `Connect to the running experience. Auto-joins whichever room is active locally.
-If a browser tab is open, you'll join that room. If no rooms exist, one is created.
+  `Connect to the running experience.
 
 Returns: available tools, current state, participants, and the browser URL.
 
@@ -116,7 +92,7 @@ Call this first before using watch or act.`,
   {},
   async () => {
     try {
-      const join = await autoJoin();
+      const join = await joinRoom();
 
       const output = [
         `Connected as ${currentActorId}`,
@@ -160,9 +136,8 @@ Auto-connects if not already connected.`,
     filterActors: z.array(z.string()).optional().describe("Only wake for these actors"),
   },
   async ({ timeout, predicate, filterTools, filterActors }) => {
-    let rid: string;
     try {
-      rid = await ensureConnected();
+      await ensureConnected();
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `Not connected: ${err.message}` }] };
     }
@@ -172,7 +147,7 @@ Auto-connects if not already connected.`,
     // Check if predicate already matches
     if (predicate) {
       try {
-        const current = await fetchJSON(`/rooms/${rid}`);
+        const current = await fetchJSON("/state");
         const fn = new Function("state", "actorId", `return ${predicate}`);
         if (fn(current.sharedState, currentActorId)) {
           return {
@@ -193,7 +168,7 @@ Auto-connects if not already connected.`,
 
     // Long-poll for events
     const data = await fetchJSON(
-      `/rooms/${rid}/events?since=${lastEventTs}&timeout=${t}`
+      `/events?since=${lastEventTs}&timeout=${t}`
     );
 
     let events = data.events || [];
@@ -254,14 +229,13 @@ Auto-connects if not already connected.`,
     input: z.record(z.any()).optional().describe("Tool input parameters"),
   },
   async ({ toolName, input }) => {
-    let rid: string;
     try {
-      rid = await ensureConnected();
+      await ensureConnected();
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `Not connected: ${err.message}` }] };
     }
 
-    const result = await fetchJSON(`/rooms/${rid}/tools/${toolName}`, {
+    const result = await fetchJSON(`/tools/${toolName}`, {
       method: "POST",
       body: JSON.stringify({
         actorId: currentActorId || "mcp-client",
@@ -273,7 +247,7 @@ Auto-connects if not already connected.`,
       return { content: [{ type: "text" as const, text: `Tool error: ${result.error}` }] };
     }
 
-    const state = await fetchJSON(`/rooms/${rid}`);
+    const state = await fetchJSON("/state");
 
     const output = [
       `${toolName} → ${JSON.stringify(result.output)}`,
@@ -298,8 +272,8 @@ Actions:
     updates: z.record(z.any()).optional().describe("Key-value pairs to merge (for set)"),
   },
   async ({ action, updates }) => {
-    const key = currentRoomId && currentActorId
-      ? `${currentRoomId}:${currentActorId}`
+    const key = currentActorId
+      ? `local:${currentActorId}`
       : "default";
 
     if (action === "get") {

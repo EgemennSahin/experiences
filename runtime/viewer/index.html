@@ -165,7 +165,7 @@
         }, children),
     };
 
-    // ── Connect to room ──────────────────────────────────────
+    // ── Connect to the experience ─────────────────────────────
 
     const SERVER = location.origin;
     const WS_URL = `ws://${location.host}`;
@@ -178,16 +178,7 @@
 
     async function start() {
       try {
-        // Get room ID from hash or create new room
-        let roomId = location.hash.slice(1);
-        if (!roomId) {
-          const room = await fetch(`${SERVER}/rooms`, { method: "POST" }).then(r => r.json());
-          if (room.error) throw new Error(room.error);
-          roomId = room.roomId;
-          location.hash = roomId;
-        }
-
-        // Connect WebSocket
+        // Connect WebSocket — single room, no room ID needed
         const ws = new WebSocket(WS_URL);
 
         let actorId = "viewer";
@@ -210,7 +201,7 @@
           reactRoot.render(
             ce(CanvasErrorBoundary, null,
               ce(Canvas, {
-                roomId,
+                roomId: "local",
                 actorId,
                 sharedState,
                 callTool,
@@ -223,7 +214,7 @@
         }
 
         async function callTool(name, input) {
-          const res = await fetch(`${SERVER}/rooms/${roomId}/tools/${name}`, {
+          const res = await fetch(`${SERVER}/tools/${name}`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ actorId, input: input || {} }),
@@ -262,7 +253,7 @@
         }
 
         ws.onopen = () => {
-          ws.send(JSON.stringify({ type: "join", roomId, username: "viewer" }));
+          ws.send(JSON.stringify({ type: "join", username: "viewer" }));
         };
 
         ws.onmessage = async (event) => {
@@ -275,7 +266,7 @@
 
             // Load client bundle
             try {
-              const bundleRes = await fetch(`${SERVER}/rooms/${roomId}/bundle`);
+              const bundleRes = await fetch(`${SERVER}/bundle`);
               const bundleCode = await bundleRes.text();
 
               const blob = new Blob([bundleCode], { type: "text/javascript" });
@@ -310,7 +301,7 @@
           if (msg.type === "experience_updated") {
             // Hot reload: re-fetch bundle and re-render
             try {
-              const bundleRes = await fetch(`${SERVER}/rooms/${roomId}/bundle`);
+              const bundleRes = await fetch(`${SERVER}/bundle`);
               const bundleCode = await bundleRes.text();
 
               const blob = new Blob([bundleCode], { type: "text/javascript" });
